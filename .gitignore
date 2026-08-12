@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Typical pipeline outputs -- not source, don't commit large binaries/data
+raw_videos/
+standardized_videos/
+dlc_project/
+xy_results/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.h5
