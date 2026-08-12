@@ -1,0 +1,353 @@
+"""Batch grayscale + resolution/frame-rate standardization for raw videos.
+
+Scans a directory of raw videos, works out one common resolution and
+frame rate for the whole batch (or uses values you specify), and
+re-encodes every video to that standard in grayscale. Doing this
+*before* any DeepLabCut step matters for two independent reasons:
+
+1. Storage: grayscale + a lower fps + a capped resolution can shrink a
+   raw video folder by 5-20x, which matters when raw recordings don't
+   fit comfortably on shared drive storage.
+2. Modeling: DeepLabCut trains one network per project. If input videos
+   have mixed resolutions/frame rates, frame extraction, labeling and
+   inference all become harder to reason about. A single trained model
+   generalizes far more reliably across a batch that shares one
+   resolution and one frame rate.
+
+Two backends are supported:
+  * ffmpeg (preferred) -- fast, robust, handles almost any input codec.
+  * OpenCV -- pure-Python fallback used automatically when the ffmpeg
+    binary isn't on PATH (slower; frame-rate resampling is a simple
+    nearest-frame duplicate/drop rather than optical interpolation).
+
+CLI example:
+    python -m video_pipeline.standardize \\
+        --input-dir raw_videos/ \\
+        --output-dir standardized_videos/ \\
+        --fps 15 \\
+        --manifest standardized_videos/manifest.csv
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from .probe import ProbeError, VideoInfo, has_ffmpeg, probe_video
+
+log = logging.getLogger("video_pipeline.standardize")
+
+DEFAULT_EXTENSIONS: Tuple[str, ...] = (".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg")
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """The single resolution/fps standard a batch of videos is converted to."""
+
+    width: int
+    height: int
+    fps: float
+
+    def __post_init__(self):
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"Target width/height must be positive, got {self.width}x{self.height}")
+        if self.fps <= 0:
+            raise ValueError(f"Target fps must be positive, got {self.fps}")
+        # Most encoders require even dimensions to produce yuv420p output.
+        object.__setattr__(self, "width", self.width - (self.width % 2))
+        object.__setattr__(self, "height", self.height - (self.height % 2))
+
+
+def discover_videos(
+    input_dir: Path,
+    extensions: Sequence[str] = DEFAULT_EXTENSIONS,
+    recursive: bool = False,
+) -> List[Path]:
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"{input_dir} is not a directory")
+    lister = input_dir.rglob if recursive else input_dir.glob
+    exts = {e.lower() for e in extensions}
+    found = [p for p in lister("*") if p.is_file() and p.suffix.lower() in exts]
+    return sorted(found)
+
+
+def compute_target_spec(
+    infos: Iterable[VideoInfo],
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None,
+) -> TargetSpec:
+    """Work out one common width/height/fps for a batch of videos.
+
+    Any dimension left unspecified is derived from the batch by taking
+    the *minimum* observed value, so standardizing only ever downsamples
+    -- it never upscales or frame-interpolates a lower-quality source,
+    which would fabricate detail/motion that was never captured.
+    """
+    infos = list(infos)
+    if not infos:
+        raise ValueError("Need at least one probed video to compute a target spec")
+
+    if width is None:
+        width = min(i.width for i in infos)
+    if height is None:
+        height = min(i.height for i in infos)
+    if fps is None:
+        positive_fps = [i.fps for i in infos if i.fps > 0]
+        if not positive_fps:
+            raise ValueError("Could not determine fps from any input video; pass --fps explicitly")
+        fps = min(positive_fps)
+
+    return TargetSpec(width=int(width), height=int(height), fps=float(fps))
+
+
+def build_output_path(src: Path, input_dir: Path, output_dir: Path, output_ext: str = ".mp4") -> Path:
+    rel = src.relative_to(input_dir)
+    return (output_dir / rel).with_suffix(output_ext)
+
+
+def build_ffmpeg_command(
+    src: Path,
+    dst: Path,
+    spec: TargetSpec,
+    grayscale: bool = True,
+    codec: str = "libx264",
+    crf: int = 18,
+    preset: str = "veryfast",
+) -> List[str]:
+    """ffmpeg command that scales+letterboxes, resamples fps, and
+    (optionally) desaturates a single video to match `spec`.
+
+    Letterboxing (scale-to-fit + pad) rather than a stretch keeps mouse
+    proportions/speed undistorted, which matters once XY coordinates are
+    later converted to real-world distances.
+    """
+    filters = [
+        f"scale={spec.width}:{spec.height}:force_original_aspect_ratio=decrease",
+        f"pad={spec.width}:{spec.height}:(ow-iw)/2:(oh-ih)/2:color=black",
+        f"fps={spec.fps}",
+    ]
+    if grayscale:
+        filters.append("format=gray")
+
+    return [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-vf", ",".join(filters),
+        "-c:v", codec,
+        "-crf", str(crf),
+        "-preset", preset,
+        "-pix_fmt", "yuv420p",
+        "-an",  # audio is irrelevant to frame-based pose tracking and a
+                # common source of A/V-sync warnings once fps is resampled
+        str(dst),
+    ]
+
+
+def run_ffmpeg(cmd: Sequence[str]) -> None:
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed ({' '.join(cmd)}):\n{result.stderr[-2000:]}")
+
+
+def _resize_and_pad(frame, target_w: int, target_h: int):
+    import cv2
+
+    h, w = frame.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    top = (target_h - new_h) // 2
+    bottom = target_h - new_h - top
+    left = (target_w - new_w) // 2
+    right = target_w - new_w - left
+    return cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+
+def standardize_with_opencv(src: Path, dst: Path, spec: TargetSpec, grayscale: bool = True) -> None:
+    """Fallback path used only when the ffmpeg binary isn't available.
+
+    Frame-rate resampling here is a simple nearest-frame selection
+    (frames are duplicated or dropped to hit the target fps) rather than
+    true optical interpolation -- fine for pose-estimation pipelines,
+    not for producing broadcast-smooth slow motion.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV could not open {src}")
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or spec.fps
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # Written as 3-channel BGR even when grayscale=True: most mp4
+    # containers/codecs expect color frames, so a desaturated-but-3-channel
+    # frame is the more broadly compatible choice than single-channel gray8.
+    writer = cv2.VideoWriter(str(dst), fourcc, spec.fps, (spec.width, spec.height), True)
+    try:
+        src_frame_idx = -1
+        next_emit_time = 0.0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            src_frame_idx += 1
+            src_time = src_frame_idx / src_fps if src_fps else src_frame_idx
+            while src_time >= next_emit_time:
+                out = _resize_and_pad(frame, spec.width, spec.height)
+                if grayscale:
+                    out = cv2.cvtColor(cv2.cvtColor(out, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+                writer.write(out)
+                next_emit_time += 1.0 / spec.fps
+    finally:
+        cap.release()
+        writer.release()
+
+
+def standardize_batch(
+    input_dir: Path,
+    output_dir: Path,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None,
+    grayscale: bool = True,
+    recursive: bool = False,
+    extensions: Sequence[str] = DEFAULT_EXTENSIONS,
+    output_ext: str = ".mp4",
+    codec: str = "libx264",
+    max_workers: int = 2,
+    dry_run: bool = False,
+    manifest_path: Optional[Path] = None,
+) -> TargetSpec:
+    videos = discover_videos(input_dir, extensions, recursive)
+    if not videos:
+        raise FileNotFoundError(f"No video files with extensions {extensions} found under {input_dir}")
+
+    log.info("Probing %d video(s)...", len(videos))
+    infos: List[VideoInfo] = []
+    for v in videos:
+        try:
+            infos.append(probe_video(v))
+        except ProbeError as exc:
+            log.warning("Skipping %s: %s", v, exc)
+
+    if not infos:
+        raise ProbeError("None of the discovered videos could be probed")
+
+    spec = compute_target_spec(infos, width=width, height=height, fps=fps)
+    log.info("Target standard: %dx%d @ %.3f fps (grayscale=%s)", spec.width, spec.height, spec.fps, grayscale)
+    for i in infos:
+        log.info("  %-40s %dx%d @ %.2f fps", i.path.name, i.width, i.height, i.fps)
+
+    if dry_run:
+        return spec
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    use_ffmpeg = has_ffmpeg()
+    if not use_ffmpeg:
+        log.warning(
+            "ffmpeg binary not found on PATH; falling back to the OpenCV backend "
+            "(slower, simpler fps resampling)."
+        )
+
+    def _process(info: VideoInfo):
+        dst = build_output_path(info.path, input_dir, output_dir, output_ext)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if use_ffmpeg:
+            run_ffmpeg(build_ffmpeg_command(info.path, dst, spec, grayscale=grayscale, codec=codec))
+        else:
+            standardize_with_opencv(info.path, dst, spec, grayscale=grayscale)
+        return info.path, dst
+
+    results: List[Tuple[Path, Optional[Path], str]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process, info): info for info in infos}
+        for fut in as_completed(futures):
+            info = futures[fut]
+            try:
+                src, dst = fut.result()
+                results.append((src, dst, "ok"))
+                log.info("Done: %s -> %s", src.name, dst)
+            except Exception as exc:
+                results.append((info.path, None, f"error: {exc}"))
+                log.error("Failed: %s (%s)", info.path.name, exc)
+
+    if manifest_path:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["source", "output", "status", "width", "height", "fps", "grayscale"])
+            for src, dst, status in results:
+                writer.writerow([src, dst or "", status, spec.width, spec.height, spec.fps, grayscale])
+        log.info("Wrote manifest: %s", manifest_path)
+
+    failed = [r for r in results if r[2] != "ok"]
+    if failed:
+        log.warning("%d/%d video(s) failed to process; see log above.", len(failed), len(results))
+
+    return spec
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--input-dir", required=True, type=Path)
+    p.add_argument("--output-dir", required=True, type=Path)
+    p.add_argument("--width", type=int, default=None, help="Target width (default: min width across inputs)")
+    p.add_argument("--height", type=int, default=None, help="Target height (default: min height across inputs)")
+    p.add_argument(
+        "--fps", type=float, default=None,
+        help="Target frame rate, e.g. 15 (default: min fps across inputs). "
+             "Lower fps = smaller files and fewer frames to label/train on.",
+    )
+    p.add_argument("--no-grayscale", dest="grayscale", action="store_false", help="Keep color instead of converting to grayscale")
+    p.add_argument("--recursive", action="store_true", help="Recurse into subdirectories of --input-dir")
+    p.add_argument("--extensions", nargs="+", default=list(DEFAULT_EXTENSIONS))
+    p.add_argument("--output-ext", default=".mp4")
+    p.add_argument("--codec", default="libx264", help="ffmpeg video codec (ignored by the OpenCV fallback)")
+    p.add_argument("--max-workers", type=int, default=2, help="Parallel ffmpeg/OpenCV jobs")
+    p.add_argument("--dry-run", action="store_true", help="Only probe and print the target spec, write nothing")
+    p.add_argument("--manifest", type=Path, default=None, help="Path to write a CSV manifest of source->output mappings")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(grayscale=True)
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    try:
+        standardize_batch(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            grayscale=args.grayscale,
+            recursive=args.recursive,
+            extensions=args.extensions,
+            output_ext=args.output_ext,
+            codec=args.codec,
+            max_workers=args.max_workers,
+            dry_run=args.dry_run,
+            manifest_path=args.manifest,
+        )
+    except Exception as exc:
+        log.error("%s", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
